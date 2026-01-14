@@ -3,11 +3,15 @@
 /// input name.
 use chrono::Local;
 use clap::{CommandFactory, Parser};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use walkdir::WalkDir;
 use zip::ZipArchive;
+
+/// Name used for files in the root of the input directory (no subdirectory).
+const ROOT_BUCKET: &str = "ROOT";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -20,6 +24,10 @@ use zip::ZipArchive;
 struct Cli {
     /// Input directory or ZIP file to process
     input: String,
+
+    /// Split output by top-level subdirectory (one file per subdirectory, plus one for root)
+    #[arg(short, long)]
+    split: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,20 +56,30 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Build the output file name in the format:
-    // YYYYMMDD-HHMMSS-<input_basename>-COMBINED.TXT
     let base_name = input_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("input");
     let now = Local::now();
     let datetime_str = now.format("%Y%m%d-%H%M%S").to_string();
+
+    if cli.split {
+        run_split(input_path, base_name, &datetime_str)
+    } else {
+        run_combined(input_path, base_name, &datetime_str)
+    }
+}
+
+/// Original behavior: combine all source files into a single output file.
+fn run_combined(
+    input_path: &Path,
+    base_name: &str,
+    datetime_str: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let output_file_name = format!("{}-{}-COMBINED.TXT", datetime_str, base_name);
     let mut output_file = File::create(&output_file_name)?;
-    // Only the literal "Creating output file:" is in light blue.
     println!("\x1b[94mCreating output file:\x1b[0m {}", output_file_name);
 
-    // Counters for progress
     let mut total_files = 0;
     let mut total_size: u64 = 0;
 
@@ -87,15 +105,87 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Move to a new line after progress updates.
     println!();
-    // Print final message with colored output:
-    // Light blue for "Processing completed." and light yellow for "Combined file created:".
     println!(
         "\x1b[94mProcessing completed.\x1b[0m \x1b[93mCombined file created: {}\x1b[0m",
         output_file_name
     );
     Ok(output_file_name)
+}
+
+/// Split mode: create one output file per top-level subdirectory.
+fn run_split(
+    input_path: &Path,
+    base_name: &str,
+    datetime_str: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Collect files into buckets by top-level subdirectory
+    let buckets: HashMap<String, Vec<(String, String)>> = if input_path.is_dir() {
+        collect_directory_buckets(input_path)?
+    } else if input_path.is_file() {
+        collect_zip_buckets(input_path)?
+    } else {
+        return Err(format!(
+            "Error: Input path '{}' is neither a directory nor a file.",
+            input_path.display()
+        )
+        .into());
+    };
+
+    if buckets.is_empty() {
+        println!("\x1b[93mNo source files found.\x1b[0m");
+        return Ok(String::new());
+    }
+
+    // Sort bucket names for consistent output order
+    let mut bucket_names: Vec<&String> = buckets.keys().collect();
+    bucket_names.sort();
+
+    let mut output_files = Vec::new();
+    let mut grand_total_files = 0;
+    let mut grand_total_size: u64 = 0;
+
+    for bucket_name in bucket_names {
+        let files = &buckets[bucket_name];
+        if files.is_empty() {
+            continue;
+        }
+
+        let output_file_name = format!("{}-{}-{}-COMBINED.TXT", datetime_str, base_name, bucket_name);
+        let mut output_file = File::create(&output_file_name)?;
+        println!("\x1b[94mCreating output file:\x1b[0m {}", output_file_name);
+
+        let mut bucket_files = 0;
+        let mut bucket_size: u64 = 0;
+
+        for (filename, content) in files {
+            write_file_content(&mut output_file, filename, content)?;
+            bucket_files += 1;
+            bucket_size += content.len() as u64;
+            print!(
+                "\r\x1B[2K\x1b[94mAdding file:\x1b[0m {} | Files: {} | Size: {}",
+                format_filename(filename, 30),
+                bucket_files,
+                format_size(bucket_size)
+            );
+            std::io::stdout().flush()?;
+        }
+
+        println!();
+        grand_total_files += bucket_files;
+        grand_total_size += bucket_size;
+        output_files.push(output_file_name);
+    }
+
+    println!(
+        "\x1b[94mProcessing completed.\x1b[0m Created {} files, {} total files, {} total size.",
+        output_files.len(),
+        grand_total_files,
+        format_size(grand_total_size)
+    );
+
+    // Return the first output file name (for test compatibility)
+    Ok(output_files.into_iter().next().unwrap_or_default())
 }
 
 /// Recursively processes a directory and writes allowed source files to the output.
@@ -173,7 +263,90 @@ fn process_zip(
     Ok(())
 }
 
-/// Writes a header (the file name), the file’s content, and a separator to the output.
+/// Collects source files from a directory into buckets by top-level subdirectory.
+/// Returns a map from bucket name to list of (filename, content) pairs.
+fn collect_directory_buckets(
+    path: &Path,
+) -> Result<HashMap<String, Vec<(String, String)>>, Box<dyn std::error::Error>> {
+    let mut buckets: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+    for entry in WalkDir::new(path) {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_file() && is_source_file(entry_path) {
+            let relative = entry_path.strip_prefix(path).unwrap_or(entry_path);
+            let bucket_name = get_bucket_name(relative);
+            let bytes = std::fs::read(entry_path)?;
+            let content = String::from_utf8_lossy(&bytes).into_owned();
+            buckets
+                .entry(bucket_name)
+                .or_default()
+                .push((entry_path.to_string_lossy().into_owned(), content));
+        }
+    }
+
+    Ok(buckets)
+}
+
+/// Collects source files from a ZIP file into buckets by top-level subdirectory.
+/// Returns a map from bucket name to list of (filename, content) pairs.
+fn collect_zip_buckets(
+    path: &Path,
+) -> Result<HashMap<String, Vec<(String, String)>>, Box<dyn std::error::Error>> {
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase())
+        != Some("zip".to_string())
+    {
+        return Err(format!(
+            "Error: Input file '{}' is not a ZIP file or a directory.",
+            path.display()
+        )
+        .into());
+    }
+
+    let mut buckets: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let file = File::open(path)?;
+    let mut zip = ZipArchive::new(file)?;
+
+    for i in 0..zip.len() {
+        let mut zip_file = zip.by_index(i)?;
+        if zip_file.is_file() {
+            let file_name = zip_file.name().to_owned();
+            if is_source_file(Path::new(&file_name)) {
+                let bucket_name = get_bucket_name(Path::new(&file_name));
+                let mut buffer = Vec::new();
+                zip_file.read_to_end(&mut buffer)?;
+                let content = String::from_utf8_lossy(&buffer).into_owned();
+                buckets
+                    .entry(bucket_name)
+                    .or_default()
+                    .push((file_name, content));
+            }
+        }
+    }
+
+    Ok(buckets)
+}
+
+/// Extracts the bucket name from a relative path.
+/// The bucket is the first path component, or ROOT_BUCKET if the file is at the root.
+fn get_bucket_name(relative_path: &Path) -> String {
+    let components: Vec<_> = relative_path.components().collect();
+    if components.len() <= 1 {
+        // File is directly in the root
+        ROOT_BUCKET.to_string()
+    } else {
+        // First component is the top-level subdirectory
+        components[0]
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Writes a header (the file name), the file's content, and a separator to the output.
 fn write_file_content(
     output: &mut File,
     filename: &str,
@@ -343,6 +516,7 @@ mod tests {
 
         let cli = Cli {
             input: dir.path().to_string_lossy().into_owned(),
+            split: false,
         };
 
         let output_filename = run(cli)?;
@@ -357,6 +531,7 @@ mod tests {
     fn test_run_invalid_path() {
         let cli = Cli {
             input: "non_existent_path_xyz".to_string(),
+            split: false,
         };
         assert!(run(cli).is_err());
     }
@@ -369,8 +544,156 @@ mod tests {
 
         let cli = Cli {
             input: txt_file.to_string_lossy().into_owned(),
+            split: false,
         };
         assert!(run(cli).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_bucket_name() {
+        // File at root level
+        assert_eq!(get_bucket_name(Path::new("main.rs")), ROOT_BUCKET);
+
+        // File in subdirectory
+        assert_eq!(get_bucket_name(Path::new("src/lib.rs")), "src");
+        assert_eq!(get_bucket_name(Path::new("tests/test1.rs")), "tests");
+
+        // File in nested subdirectory (should still use top-level)
+        assert_eq!(get_bucket_name(Path::new("src/utils/helpers.rs")), "src");
+    }
+
+    #[test]
+    fn test_split_directory() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a temp directory with files in root and subdirectories
+        let dir = tempdir()?;
+
+        // Root file
+        fs::write(dir.path().join("main.rs"), "fn main() {}")?;
+
+        // src subdirectory
+        fs::create_dir(dir.path().join("src"))?;
+        fs::write(dir.path().join("src/lib.rs"), "pub fn lib() {}")?;
+        fs::write(dir.path().join("src/util.rs"), "pub fn util() {}")?;
+
+        // tests subdirectory
+        fs::create_dir(dir.path().join("tests"))?;
+        fs::write(dir.path().join("tests/test1.rs"), "#[test] fn test1() {}")?;
+
+        let cli = Cli {
+            input: dir.path().to_string_lossy().into_owned(),
+            split: true,
+        };
+
+        let first_output = run(cli)?;
+        assert!(!first_output.is_empty());
+
+        // Should have created 3 output files (ROOT, src, tests)
+        // Find all generated files by pattern
+        let output_files: Vec<_> = std::fs::read_dir(".")?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.to_string_lossy().contains("-COMBINED.TXT")
+                    && p.to_string_lossy().contains(&dir.path().file_name().unwrap().to_string_lossy().to_string())
+            })
+            .collect();
+
+        assert_eq!(output_files.len(), 3, "Expected 3 output files, got {:?}", output_files);
+
+        // Cleanup
+        for f in output_files {
+            fs::remove_file(f)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_zip() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let zip_path = dir.path().join("project.zip");
+        {
+            let file = File::create(&zip_path)?;
+            let mut zip = zip::ZipWriter::new(file);
+            let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+            // Root file
+            zip.start_file("main.c", options)?;
+            zip.write_all(b"int main() { return 0; }")?;
+
+            // src subdirectory
+            zip.add_directory("src/", options)?;
+            zip.start_file("src/lib.c", options)?;
+            zip.write_all(b"void lib() {}")?;
+
+            zip.finish()?;
+        }
+
+        let cli = Cli {
+            input: zip_path.to_string_lossy().into_owned(),
+            split: true,
+        };
+
+        let first_output = run(cli)?;
+        assert!(!first_output.is_empty());
+
+        // Should have created 2 output files (ROOT, src)
+        let output_files: Vec<_> = std::fs::read_dir(".")?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.to_string_lossy().contains("-COMBINED.TXT")
+                    && p.to_string_lossy().contains("project")
+            })
+            .collect();
+
+        assert_eq!(output_files.len(), 2, "Expected 2 output files, got {:?}", output_files);
+
+        // Cleanup
+        for f in output_files {
+            fs::remove_file(f)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_empty_subdirs_skipped() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a temp directory where one subdir has no source files
+        let dir = tempdir()?;
+
+        // src subdirectory with source files
+        fs::create_dir(dir.path().join("src"))?;
+        fs::write(dir.path().join("src/lib.rs"), "pub fn lib() {}")?;
+
+        // docs subdirectory with only txt files (should be skipped)
+        fs::create_dir(dir.path().join("docs"))?;
+        fs::write(dir.path().join("docs/readme.txt"), "Documentation")?;
+
+        let cli = Cli {
+            input: dir.path().to_string_lossy().into_owned(),
+            split: true,
+        };
+
+        let first_output = run(cli)?;
+        assert!(!first_output.is_empty());
+
+        // Should have created only 1 output file (src), docs should be skipped
+        let output_files: Vec<_> = std::fs::read_dir(".")?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.to_string_lossy().contains("-COMBINED.TXT")
+                    && p.to_string_lossy().contains(&dir.path().file_name().unwrap().to_string_lossy().to_string())
+            })
+            .collect();
+
+        assert_eq!(output_files.len(), 1, "Expected 1 output file, got {:?}", output_files);
+        assert!(output_files[0].to_string_lossy().contains("-src-"), "Expected src output file");
+
+        // Cleanup
+        for f in output_files {
+            fs::remove_file(f)?;
+        }
         Ok(())
     }
 }
